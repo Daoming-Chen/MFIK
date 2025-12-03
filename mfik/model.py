@@ -2,19 +2,43 @@ import torch
 import torch.nn as nn
 import math
 
-class ResBlock(nn.Module):
-    def __init__(self, dim, dropout_rate=0.1):
+class ResBlockAdaLN(nn.Module):
+    def __init__(self, dim, cond_dim, dropout_rate=0.1):
         super().__init__()
-        self.block = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.LayerNorm(dim),
-            nn.GELU(),
-            nn.Linear(dim, dim),
-            nn.Dropout(dropout_rate)
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)
+        
+        self.linear1 = nn.Linear(dim, dim)
+        self.act = nn.GELU()
+        self.linear2 = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(dropout_rate)
+        
+        # adaLN modulation: input condition, output scale/shift
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(cond_dim, 4 * dim, bias=True)
         )
+        
+        # Zero initialization for adaLN (identity mapping at start)
+        with torch.no_grad():
+            self.adaLN_modulation[1].weight.zero_()
+            self.adaLN_modulation[1].bias.zero_()
 
-    def forward(self, x):
-        return x + self.block(x)
+    def forward(self, x, c):
+        shift_scale = self.adaLN_modulation(c)
+        shift1, scale1, shift2, scale2 = shift_scale.chunk(4, dim=1)
+        
+        # Block 1
+        h = self.norm1(x)
+        h = h * (1 + scale1) + shift1
+        h = self.act(self.linear1(h))
+        
+        # Block 2
+        h = self.norm2(h)
+        h = h * (1 + scale2) + shift2
+        h = self.dropout(self.linear2(h))
+        
+        return x + h
 
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
@@ -41,17 +65,27 @@ class MeanFlowNetwork(nn.Module):
         )
 
         # Input: state + condition + t_emb + (t-r)_emb
+        # We keep the input projection as is (early fusion), but also use adaLN
         input_total_dim = state_dim + condition_dim + 2 * time_emb_dim
+        
+        # Dimension of the conditioning vector for adaLN
+        # c = [condition, t_emb, tr_emb]
+        self.cond_dim = condition_dim + 2 * time_emb_dim
         
         self.input_proj = nn.Linear(input_total_dim, hidden_dim)
 
         self.blocks = nn.ModuleList([
-            ResBlock(hidden_dim, dropout_rate) for _ in range(depth)
+            ResBlockAdaLN(hidden_dim, self.cond_dim, dropout_rate) for _ in range(depth)
         ])
 
         self.output_proj = nn.Linear(hidden_dim, state_dim)
         
         self.feature_layer_idx = depth // 2  # Extract from middle
+        
+        # Initialize output projection to zero (standard practice for flow matching)
+        with torch.no_grad():
+            self.output_proj.weight.zero_()
+            self.output_proj.bias.zero_()
 
     def forward(self, z, r, t, condition):
         """
@@ -70,15 +104,17 @@ class MeanFlowNetwork(nn.Module):
         t_emb = self.time_mlp(t)
         tr_emb = self.time_mlp(t - r)
         
-        # Concatenate all inputs
-        # [z, condition, t_emb, tr_emb]
-        x = torch.cat([z, condition, t_emb, tr_emb], dim=-1)
+        # Construct conditioning vector c
+        c = torch.cat([condition, t_emb, tr_emb], dim=-1)
         
-        x = self.input_proj(x)
+        # Input projection (Early Fusion)
+        # [z, c]
+        x_input = torch.cat([z, c], dim=-1)
+        x = self.input_proj(x_input)
 
         features = None
         for i, block in enumerate(self.blocks):
-            x = block(x)
+            x = block(x, c)
             # Store features for dispersive loss (Phase 3)
             if i == self.feature_layer_idx:
                 features = x
