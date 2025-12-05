@@ -1,7 +1,7 @@
 import argparse
 import os
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, TensorDataset
 import numpy as np
 import tqdm
 from torch.utils.tensorboard import SummaryWriter
@@ -9,21 +9,6 @@ import copy
 
 from mfik.model import ConditionalMLP
 from mfik.loss import MeanFlowLoss
-
-
-class IKDataset(Dataset):
-    def __init__(self, data_path, split="train"):
-        # Load PyTorch format dataset (GPU-friendly)
-        data = torch.load(data_path, map_location="cpu")
-        self.poses = data[f"poses_{split}"]
-        self.joints = data[f"joints_{split}"]
-        self.metadata = data["metadata"]
-
-    def __len__(self):
-        return len(self.poses)
-
-    def __getitem__(self, idx):
-        return self.joints[idx], self.poses[idx]
 
 
 def get_args():
@@ -73,22 +58,23 @@ def main():
     writer = SummaryWriter(log_dir=os.path.join(args.output_dir, "logs"))
 
     # Data
-    print(f"Loading data from {args.data}...")
-    train_dataset = IKDataset(args.data, split="train")
-    val_dataset = IKDataset(args.data, split="val")
+    print(f"Loading data from {args.data} to {args.device}...")
+    # Load directly to GPU to avoid CPU-GPU transfer bottleneck
+    data = torch.load(args.data, map_location=args.device)
+    
+    train_dataset = TensorDataset(data["joints_train"], data["poses_train"])
+    val_dataset = TensorDataset(data["joints_val"], data["poses_val"])
 
+    # Use num_workers=0 because data is already on GPU
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=8,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2,
+        num_workers=0,
     )
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
-    n_joints = train_dataset.joints.shape[1]
+    n_joints = data["joints_train"].shape[1]
     print(f"Number of joints: {n_joints}")
 
     # Model
@@ -137,8 +123,9 @@ def main():
 
         pbar = tqdm.tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
         for joints, pose in pbar:
-            joints = joints.to(args.device, dtype=torch.float32)
-            pose = pose.to(args.device, dtype=torch.float32)
+            # Data is already on device
+            # joints = joints.to(args.device, dtype=torch.float32)
+            # pose = pose.to(args.device, dtype=torch.float32)
 
             loss, raw_loss = loss_fn(model, joints, pose)
 
@@ -176,8 +163,9 @@ def main():
         val_loss = torch.tensor(0.0, device=args.device)
         with torch.no_grad():
             for joints, pose in val_loader:
-                joints = joints.to(args.device, dtype=torch.float32)
-                pose = pose.to(args.device, dtype=torch.float32)
+                # Data is already on device
+                # joints = joints.to(args.device, dtype=torch.float32)
+                # pose = pose.to(args.device, dtype=torch.float32)
                 # Use EMA model for validation
                 loss, _ = loss_fn(ema_model, joints, pose)
                 val_loss += loss
