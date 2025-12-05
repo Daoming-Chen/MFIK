@@ -2528,11 +2528,14 @@ class Joint(URDFType):
         M[:, :3, :3] += axis_outer * (1.0 - cosa).unsqueeze(-1).unsqueeze(-1)
         
         # Skew-symmetric matrix
-        skew = torch.tensor([
-            [0.0, -axis[2], axis[1]],
-            [axis[2], 0.0, -axis[0]],
-            [-axis[1], axis[0], 0.0]
-        ], dtype=torch.float32, device=device).unsqueeze(0).repeat(n, 1, 1)
+        skew = torch.zeros((3, 3), dtype=torch.float32, device=device)
+        skew[0, 1] = -axis[2]
+        skew[0, 2] = axis[1]
+        skew[1, 0] = axis[2]
+        skew[1, 2] = -axis[0]
+        skew[2, 0] = -axis[1]
+        skew[2, 1] = axis[0]
+        skew = skew.unsqueeze(0).repeat(n, 1, 1)
         
         M[:, :3, :3] += skew * sina.unsqueeze(-1).unsqueeze(-1)
         return M

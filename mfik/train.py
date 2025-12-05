@@ -2,6 +2,7 @@ import argparse
 import os
 import torch
 from torch.utils.data import Dataset, DataLoader, TensorDataset
+from torch.amp import autocast, GradScaler
 import numpy as np
 import tqdm
 from torch.utils.tensorboard import SummaryWriter
@@ -40,6 +41,18 @@ def get_args():
                         help="Maximum noise std for q_ref generation")
     parser.add_argument("--curriculum", action="store_true", default=True,
                         help="Use curriculum learning for noise (large->small)")
+    
+    # Performance optimization params
+    parser.add_argument("--amp", action="store_true", default=True,
+                        help="Enable automatic mixed precision training")
+    parser.add_argument("--no-amp", action="store_false", dest="amp",
+                        help="Disable automatic mixed precision training")
+    parser.add_argument("--compile", action="store_true", default=True,
+                        help="Use torch.compile for model optimization")
+    parser.add_argument("--no-compile", action="store_false", dest="compile",
+                        help="Disable torch.compile")
+    parser.add_argument("--grad-accum-steps", type=int, default=1,
+                        help="Gradient accumulation steps")
 
     return parser.parse_args()
 
@@ -48,6 +61,44 @@ def update_ema(model, ema_model, decay=0.9999):
     with torch.no_grad():
         for param, ema_param in zip(model.parameters(), ema_model.parameters()):
             ema_param.data.mul_(decay).add_(param.data, alpha=1 - decay)
+
+
+class FastTensorDataLoader:
+    """
+    A DataLoader-like object for a set of tensors that can be much faster than
+    TensorDataset + DataLoader because it avoids the overhead of single-item
+    fetching and collation.
+    """
+    def __init__(self, *tensors, batch_size=32, shuffle=False):
+        assert all(t.shape[0] == tensors[0].shape[0] for t in tensors)
+        self.tensors = tensors
+        self.dataset_len = tensors[0].shape[0]
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+
+    def __iter__(self):
+        if self.shuffle:
+            self.indices = torch.randperm(self.dataset_len, device=self.tensors[0].device)
+        else:
+            self.indices = None
+        self.i = 0
+        return self
+
+    def __next__(self):
+        if self.i >= self.dataset_len:
+            raise StopIteration
+        
+        if self.indices is not None:
+            indices = self.indices[self.i:self.i+self.batch_size]
+            batch = tuple(t[indices] for t in self.tensors)
+        else:
+            batch = tuple(t[self.i:self.i+self.batch_size] for t in self.tensors)
+            
+        self.i += self.batch_size
+        return batch
+
+    def __len__(self):
+        return (self.dataset_len + self.batch_size - 1) // self.batch_size
 
 
 def main():
@@ -62,17 +113,17 @@ def main():
     # Load directly to GPU to avoid CPU-GPU transfer bottleneck
     data = torch.load(args.data, map_location=args.device)
     
-    train_dataset = TensorDataset(data["joints_train"], data["poses_train"])
-    val_dataset = TensorDataset(data["joints_val"], data["poses_val"])
-
-    # Use num_workers=0 because data is already on GPU
-    train_loader = DataLoader(
-        train_dataset,
+    # Use FastTensorDataLoader for efficiency
+    train_loader = FastTensorDataLoader(
+        data["joints_train"], data["poses_train"],
         batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=0,
+        shuffle=True
     )
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    val_loader = FastTensorDataLoader(
+        data["joints_val"], data["poses_val"],
+        batch_size=args.batch_size,
+        shuffle=False
+    )
 
     n_joints = data["joints_train"].shape[1]
     print(f"Number of joints: {n_joints}")
@@ -83,12 +134,23 @@ def main():
     ema_model.requires_grad_(False)
 
     # Compile model for faster training
-    if hasattr(torch, "compile"):
-        print("Compiling model with torch.compile...")
-        model = torch.compile(model)
+    # Use 'reduce-overhead' mode for small models (reduces CPU overhead)
+    # 'max-autotune' is better for large models with big matrices
+    if args.compile and hasattr(torch, "compile"):
+        print("Compiling model with torch.compile (mode=reduce-overhead)...")
+        model = torch.compile(model, mode="reduce-overhead")
+    
+    # Enable TF32 for better performance on Ampere+ GPUs
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4, fused=True)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    
+    # AMP scaler for mixed precision training
+    scaler = GradScaler('cuda', enabled=args.amp)
+    use_amp = args.amp and args.device == "cuda"
 
     # Loss function with Neighborhood Projection
     loss_fn = MeanFlowLoss(
@@ -108,10 +170,23 @@ def main():
         ema_model.load_state_dict(checkpoint["ema_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         start_epoch = checkpoint["epoch"] + 1
+        
+        # Attempt to load scheduler and scaler states if they exist
+        if "scheduler_state_dict" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        if "scaler_state_dict" in checkpoint:
+            scaler.load_state_dict(checkpoint["scaler_state_dict"])
+            
+        # IMPORTANT: When resuming, especially if extending epochs, we must ensure
+        # the scheduler knows the correct last_epoch to calculate the LR correctly.
+        # If we don't set this, it might reset to initial LR or behave unexpectedly.
+        scheduler.last_epoch = start_epoch - 1
 
     print("Starting training with Neighborhood Projection method...")
     print(f"  Noise std range: [{args.noise_std_min}, {args.noise_std_max}]")
     print(f"  Curriculum learning: {args.curriculum}")
+    print(f"  Mixed precision (AMP): {use_amp}")
+    print(f"  Batch size: {args.batch_size}")
     
     global_step = 0
     for epoch in range(start_epoch, args.epochs):
@@ -122,27 +197,33 @@ def main():
         loss_fn.set_epoch(epoch, args.epochs)
 
         pbar = tqdm.tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
-        for joints, pose in pbar:
-            # Data is already on device
-            # joints = joints.to(args.device, dtype=torch.float32)
-            # pose = pose.to(args.device, dtype=torch.float32)
+        optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
+        
+        for batch_idx, (joints, pose) in enumerate(pbar):
+            # Use automatic mixed precision for forward pass
+            with autocast('cuda', enabled=use_amp):
+                loss, raw_loss = loss_fn(model, joints, pose)
+                loss = loss / args.grad_accum_steps
+            
+            # Scaled backward pass
+            scaler.scale(loss).backward()
+            
+            # Gradient accumulation
+            if (batch_idx + 1) % args.grad_accum_steps == 0:
+                # Unscale before clipping
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                update_ema(model, ema_model)
 
-            loss, raw_loss = loss_fn(model, joints, pose)
-
-            optimizer.zero_grad()
-            loss.backward()
-
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
-            optimizer.step()
-            update_ema(model, ema_model)
-
-            train_loss += loss.detach()
+            train_loss += loss.detach() * args.grad_accum_steps
             global_step += 1
 
             if global_step % 100 == 0:
-                loss_val = loss.item()
+                loss_val = loss.item() * args.grad_accum_steps
                 writer.add_scalar("train/loss", loss_val, global_step)
                 writer.add_scalar("train/raw_loss", raw_loss.item(), global_step)
                 writer.add_scalar(
@@ -153,7 +234,7 @@ def main():
                     current_noise = loss_fn.get_noise_std(1, joints.device).item()
                     writer.add_scalar("train/noise_std", current_noise, global_step)
 
-                pbar.set_postfix({"loss": f"{loss_val:.4f}"})
+                pbar.set_postfix({"loss": f"{loss_val:.4f}", "amp": use_amp})
 
         avg_train_loss = train_loss.item() / len(train_loader)
         scheduler.step()
@@ -161,11 +242,8 @@ def main():
         # Validation
         model.eval()
         val_loss = torch.tensor(0.0, device=args.device)
-        with torch.no_grad():
+        with torch.no_grad(), autocast('cuda', enabled=use_amp):
             for joints, pose in val_loader:
-                # Data is already on device
-                # joints = joints.to(args.device, dtype=torch.float32)
-                # pose = pose.to(args.device, dtype=torch.float32)
                 # Use EMA model for validation
                 loss, _ = loss_fn(ema_model, joints, pose)
                 val_loss += loss
@@ -185,6 +263,8 @@ def main():
                     "model_state_dict": model.state_dict(),
                     "ema_state_dict": ema_model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "scaler_state_dict": scaler.state_dict(),
                     "config": vars(args),
                 },
                 save_path,
@@ -199,6 +279,8 @@ def main():
             "model_state_dict": model.state_dict(),
             "ema_state_dict": ema_model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "scaler_state_dict": scaler.state_dict(),
             "config": vars(args),
         },
         final_path,

@@ -130,9 +130,14 @@ python -m mfik.dataset_generator \
 # 2. 训练模型
 python -m mfik.train \
     --data data/panda_dataset.pt \
-    --output-dir checkpoints/panda_run1 \
-    --epochs 100 \
-    --curriculum
+    --output-dir checkpoints/panda \
+    --batch-size 8192 \
+    --epochs 400 \
+    --lr 1e-4 \
+    --noise-std-min 0.1 \
+    --noise-std-max 1.0 \
+    --curriculum \
+    --amp
 
 # 3. 评估模型
 python -m mfik.evaluate \

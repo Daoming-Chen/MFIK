@@ -290,6 +290,63 @@ def plot_error_distributions(pos_errors, rot_errors, joint_errors, output_path):
     print(f"Saved error distribution plots to {output_path}")
 
 
+def evaluate_random_baseline(data_loader, robot, end_effector, device="cpu"):
+    """Evaluate random baseline"""
+    print("Evaluating random baseline...")
+    all_pos_errors = []
+    all_rot_errors = []
+    
+    # Get joint limits from robot model if possible, otherwise assume [-pi, pi]
+    # For simplicity, we'll use [-pi, pi] as generic limits or standard normal
+    # But standard normal is what the model uses for initialization
+    
+    for joints_true, pose_target in tqdm(data_loader, desc="Random Baseline"):
+        batch_size = pose_target.shape[0]
+        n_joints = joints_true.shape[1]
+        
+        # Generate random joints
+        # Using uniform [-pi, pi] is probably a fairer "random" baseline for IK
+        # than standard normal, as it covers the workspace.
+        joints_random = torch.rand(batch_size, n_joints) * 2 * np.pi - np.pi
+        joints_random = joints_random.numpy()
+        
+        # Compute FK
+        transforms_pred = robot.link_fk_batch(cfgs=[j for j in joints_random], link=end_effector)
+        
+        positions_pred = transforms_pred[:, :3, 3]
+        rot_matrices_pred = transforms_pred[:, :3, :3]
+        quaternions_pred = Rotation.from_matrix(rot_matrices_pred).as_quat()
+        
+        positions_target = pose_target[:, :3].numpy()
+        quaternions_target = pose_target[:, 3:].numpy()
+        
+        pos_errors = np.linalg.norm(positions_pred - positions_target, axis=1)
+        rot_errors = quaternion_distance(quaternions_pred, quaternions_target)
+        
+        all_pos_errors.extend(pos_errors.tolist())
+        all_rot_errors.extend(rot_errors.tolist())
+        
+    all_pos_errors = np.array(all_pos_errors)
+    all_rot_errors = np.array(all_rot_errors)
+    
+    success_mask = (all_pos_errors < 0.01) & (all_rot_errors < 5.0)
+    success_rate = success_mask.mean() * 100
+    
+    print("\n" + "=" * 60)
+    print("Random Baseline Results")
+    print("=" * 60)
+    print(f"Success Rate: {success_rate:.2f}%")
+    print(f"Position Error (mm): Mean: {all_pos_errors.mean()*1000:.2f}")
+    print(f"Rotation Error (deg): Mean: {all_rot_errors.mean():.2f}")
+    print("=" * 60)
+    
+    return {
+        "success_rate": success_rate,
+        "position_error_mean": float(all_pos_errors.mean()),
+        "rotation_error_mean": float(all_rot_errors.mean())
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -316,6 +373,14 @@ def main():
     parser.add_argument(
         "--use-gt-ref", action="store_true",
         help="Use ground truth joints as q_ref (trajectory tracking mode)"
+    )
+    parser.add_argument(
+        "--noise-scale", type=float, default=None,
+        help="Override noise scale condition (default: 1.0 for global, 0.1 for tracking)"
+    )
+    parser.add_argument(
+        "--compare-random", action="store_true",
+        help="Compare with random baseline"
     )
 
     args = parser.parse_args()
@@ -350,14 +415,20 @@ def main():
     mode_str = "trajectory tracking" if args.use_gt_ref else "global solving"
     
     # Determine noise scale
-    # For global solving (random init), we are far from manifold, so use large noise scale (e.g. max training noise)
-    # For tracking (GT + noise), we are close, so use small noise scale
-    # Note: Model was trained with noise in [0.1, 1.0]. Passing 0.0 is OOD.
-    noise_scale = 1.0 if not args.use_gt_ref else 0.1
+    if args.noise_scale is not None:
+        noise_scale = args.noise_scale
+    else:
+        # For global solving (random init), we are far from manifold, so use large noise scale (e.g. max training noise)
+        # For tracking (GT + noise), we are close, so use small noise scale
+        # Note: Model was trained with noise in [0.1, 1.0]. Passing 0.0 is OOD.
+        noise_scale = 1.0 if not args.use_gt_ref else 0.1
     
     print(f"Evaluating with {args.num_steps}-step sampling ({mode_str} mode)...")
     print(f"Using noise_scale condition: {noise_scale}")
     
+    if args.compare_random:
+        evaluate_random_baseline(test_loader, robot, args.end_effector, device=args.device)
+
     metrics, pos_errors, rot_errors, joint_errors = evaluate_model(
         model,
         test_loader,
