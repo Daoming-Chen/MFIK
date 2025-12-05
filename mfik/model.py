@@ -1,44 +1,7 @@
 import torch
 import torch.nn as nn
-import math
+import numpy as np
 
-class ResBlockAdaLN(nn.Module):
-    def __init__(self, dim, cond_dim, dropout_rate=0.1):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)
-        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)
-        
-        self.linear1 = nn.Linear(dim, dim)
-        self.act = nn.GELU()
-        self.linear2 = nn.Linear(dim, dim)
-        self.dropout = nn.Dropout(dropout_rate)
-        
-        # adaLN modulation: input condition, output scale/shift
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(cond_dim, 4 * dim, bias=True)
-        )
-        
-        # Zero initialization for adaLN (identity mapping at start)
-        with torch.no_grad():
-            self.adaLN_modulation[1].weight.zero_()
-            self.adaLN_modulation[1].bias.zero_()
-
-    def forward(self, x, c):
-        shift_scale = self.adaLN_modulation(c)
-        shift1, scale1, shift2, scale2 = shift_scale.chunk(4, dim=1)
-        
-        # Block 1
-        h = self.norm1(x)
-        h = h * (1 + scale1) + shift1
-        h = self.act(self.linear1(h))
-        
-        # Block 2
-        h = self.norm2(h)
-        h = h * (1 + scale2) + shift2
-        h = self.dropout(self.linear2(h))
-        
-        return x + h
 
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
@@ -48,78 +11,147 @@ class SinusoidalPosEmb(nn.Module):
     def forward(self, x):
         device = x.device
         half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
+        emb = np.log(10000) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
         emb = x[:, None] * emb[None, :]
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb
 
-class MeanFlowNetwork(nn.Module):
-    def __init__(self, state_dim, condition_dim, hidden_dim=512, depth=6, dropout_rate=0.1, time_emb_dim=64):
+
+class ConditionalMLP(nn.Module):
+    """
+    Conditional MLP for MeanFlow IK with Neighborhood Projection.
+    
+    Key design from method.md:
+    - Network learns residual Δq, output = z_t + Δq (residual connection)
+    - This makes it easier to learn small corrections from q_ref to q_gt
+    - z_t is the current state along the flow trajectory
+    """
+    
+    def __init__(
+        self, n_joints, condition_dim=7, time_emb_dim=64, hidden_dim=1024,
+        use_residual=True  # New: enable/disable residual connection
+    ):
         super().__init__()
+        self.n_joints = n_joints
+        self.condition_dim = condition_dim
+        self.time_emb_dim = time_emb_dim
+        self.use_residual = use_residual
+
+        # Time embedding for r and t
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(time_emb_dim),
-            nn.Linear(time_emb_dim, time_emb_dim),
-            nn.GELU(),
-            nn.Linear(time_emb_dim, time_emb_dim),
+            nn.Linear(time_emb_dim, time_emb_dim * 2),
+            nn.SiLU(),
+            nn.Linear(time_emb_dim * 2, time_emb_dim),
         )
 
-        # Input: state + condition + t_emb + (t-r)_emb
-        # We keep the input projection as is (early fusion), but also use adaLN
-        input_total_dim = state_dim + condition_dim + 2 * time_emb_dim
-        
-        # Dimension of the conditioning vector for adaLN
-        # c = [condition, t_emb, tr_emb]
-        self.cond_dim = condition_dim + 2 * time_emb_dim
-        
-        self.input_proj = nn.Linear(input_total_dim, hidden_dim)
+        # Input dimension: z_t (n_joints) + pose (condition_dim) + r_emb (time_emb_dim) + t_emb (time_emb_dim) + noise_scale (1)
+        input_dim = n_joints + condition_dim + time_emb_dim * 2 + 1
 
-        self.blocks = nn.ModuleList([
-            ResBlockAdaLN(hidden_dim, self.cond_dim, dropout_rate) for _ in range(depth)
+        # Main network with residual blocks
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+        )
+        
+        # Residual blocks for better gradient flow
+        self.res_blocks = nn.ModuleList([
+            ResidualBlock(hidden_dim) for _ in range(4)
         ])
-
-        self.output_proj = nn.Linear(hidden_dim, state_dim)
         
-        self.feature_layer_idx = depth // 2  # Extract from middle
+        self.output_proj = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 2, n_joints),
+        )
         
-        # Initialize output projection to zero (standard practice for flow matching)
-        with torch.no_grad():
-            self.output_proj.weight.zero_()
-            self.output_proj.bias.zero_()
+        # Initialize output layer with small weights for stable training
+        nn.init.zeros_(self.output_proj[-1].bias)
+        nn.init.normal_(self.output_proj[-1].weight, std=0.01)
 
-    def forward(self, z, r, t, condition):
+    def forward(self, z_t, pose, r, t, noise_scale):
         """
-        z: Noisy state [Batch, D]
-        r: Reference time [Batch] (or scalar)
-        t: Current time [Batch] (or scalar)
-        condition: Conditioning vector (e.g., target pose) [Batch, C]
+        Args:
+            z_t: (B, n_joints) Current joint configuration along flow
+            pose: (B, condition_dim) Target end-effector pose
+            r: (B,) Time parameter r
+            t: (B,) Time parameter t
+            noise_scale: (B, 1) or (B,) Noise scale parameter (projection radius)
+        Returns:
+            u_pred: (B, n_joints) Predicted velocity field
         """
+        # Embed time
+        r_emb = self.time_mlp(r)  # (B, time_emb_dim)
+        t_emb = self.time_mlp(t)  # (B, time_emb_dim)
+
+        # Reshape noise_scale if needed
+        if noise_scale.dim() == 1:
+            noise_scale = noise_scale.unsqueeze(-1)  # (B, 1)
+
+        # Concatenate inputs
+        x = torch.cat([z_t, pose, r_emb, t_emb, noise_scale], dim=-1)
+
+        # Forward pass through network
+        h = self.input_proj(x)
+        for block in self.res_blocks:
+            h = block(h)
+        delta = self.output_proj(h)
         
-        # Expand scalar times if necessary
-        if isinstance(r, (int, float)):
-            r = torch.full((z.shape[0],), r, device=z.device)
-        if isinstance(t, (int, float)):
-            t = torch.full((z.shape[0],), t, device=z.device)
+        # Return velocity field (delta is the correction direction)
+        # Note: The velocity u predicts how to move from z_t towards the target
+        return delta
 
-        t_emb = self.time_mlp(t)
-        tr_emb = self.time_mlp(t - r)
+
+class ResidualBlock(nn.Module):
+    """Residual block for better gradient flow"""
+    def __init__(self, dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+        )
+        self.act = nn.SiLU()
         
-        # Construct conditioning vector c
-        c = torch.cat([condition, t_emb, tr_emb], dim=-1)
-        
-        # Input projection (Early Fusion)
-        # [z, c]
-        x_input = torch.cat([z, c], dim=-1)
-        x = self.input_proj(x_input)
+    def forward(self, x):
+        return self.act(x + self.net(x))
 
-        features = None
-        for i, block in enumerate(self.blocks):
-            x = block(x, c)
-            # Store features for dispersive loss (Phase 3)
-            if i == self.feature_layer_idx:
-                features = x
 
-        out = self.output_proj(x)
-        return out, features
+if __name__ == "__main__":
+    # Simple test
+    batch_size = 4
+    n_joints = 7
+    model = ConditionalMLP(n_joints)
 
-    # I will rewrite the class to properly handle inputs as described.
+    z_t = torch.randn(batch_size, n_joints)
+    pose = torch.randn(batch_size, 7)
+    r = torch.rand(batch_size)
+    t = torch.rand(batch_size)
+    c = torch.zeros(batch_size)
+
+    u = model(z_t, pose, r, t, c)
+    print(f"Input shape: {z_t.shape}, Output shape: {u.shape}")
+    print("Model test passed!")
+
+
+if __name__ == "__main__":
+    # Simple test
+    batch_size = 4
+    n_joints = 7
+    model = ConditionalMLP(n_joints)
+
+    z_t = torch.randn(batch_size, n_joints)
+    pose = torch.randn(batch_size, 7)
+    r = torch.rand(batch_size)
+    t = torch.rand(batch_size)
+    c = torch.zeros(batch_size)
+
+    u = model(z_t, pose, r, t, c)
+    print(f"Output shape: {u.shape}")
+    assert u.shape == (batch_size, n_joints)
+    print("Model test passed!")

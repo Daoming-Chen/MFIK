@@ -1,651 +1,402 @@
-"""
-Evaluation and visualization utilities for MeanFlow IK models.
-
-Features:
-- Model evaluation with comprehensive metrics
-- Error distribution visualization
-- Workspace coverage analysis
-- Per-joint error analysis
-- Interactive 3D visualization of predictions
-"""
-import torch
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.gridspec import GridSpec
-from mpl_toolkits.mplot3d import Axes3D
-from pathlib import Path
+import argparse
+import os
 import json
 import time
-from typing import Optional, Dict, Any, Tuple
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+from scipy.spatial.transform import Rotation
+from tqdm import tqdm
+import matplotlib.pyplot as plt
 
-from mfik.model import MeanFlowNetwork
-from mfik.robot_fk import RobotFK
+from mfik.model import ConditionalMLP
+from mfik.urdf import URDF
 
 
-class Evaluator:
+class IKDataset(Dataset):
+    def __init__(self, data_path, split="test"):
+        # Load PyTorch format dataset (GPU-friendly)
+        data = torch.load(data_path, map_location="cpu")
+        self.poses = data[f"poses_{split}"]
+        self.joints = data[f"joints_{split}"]
+        self.metadata = data["metadata"]
+
+    def __len__(self):
+        return len(self.poses)
+
+    def __getitem__(self, idx):
+        return self.joints[idx], self.poses[idx]
+
+
+@torch.no_grad()
+def meanflow_ik_sampler(model, pose_target, q_ref=None, num_steps=1, device="cpu"):
     """
-    Comprehensive evaluator for MeanFlow IK models.
+    MeanFlow IK sampler with Neighborhood Projection.
     
-    Provides:
-    - Accuracy metrics (position error, orientation error, success rates)
-    - Error distribution analysis
-    - Visualization of results
-    - Workspace coverage analysis
-    """
-    
-    def __init__(
-        self,
-        checkpoint_path: str,
-        urdf_path: str,
-        device: Optional[str] = None
-    ):
-        """
-        Initialize evaluator.
-        
-        Args:
-            checkpoint_path: Path to model checkpoint
-            urdf_path: Path to robot URDF file
-            device: Device to use ('cuda' or 'cpu', None = auto)
-        """
-        if device is None:
-            device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.device = device
-        
-        # Load checkpoint
-        self.checkpoint_path = Path(checkpoint_path)
-        self.checkpoint = torch.load(checkpoint_path, map_location=device)
-        self.config = self.checkpoint['config']
-        self.metadata = self.checkpoint['dataset_metadata']
-        
-        # Create and load model
-        self.n_joints = self.metadata['n_joints']
-        self.model = MeanFlowNetwork(
-            state_dim=self.n_joints,
-            condition_dim=7,
-            hidden_dim=self.config.get('hidden_dim', 512),
-            depth=self.config.get('depth', 6)
-        ).to(device)
-        
-        # Load weights (prefer EMA model)
-        if 'ema_model_state_dict' in self.checkpoint:
-            self.model.load_state_dict(self.checkpoint['ema_model_state_dict'])
-            self.using_ema = True
-        else:
-            self.model.load_state_dict(self.checkpoint['model_state_dict'])
-            self.using_ema = False
-        
-        self.model.eval()
-        
-        # Load robot FK
-        self.urdf_path = urdf_path
-        self.robot_fk = RobotFK(urdf_path, device=device)
-        
-        # Get joint limits from metadata
-        q_min, q_max = [], []
-        for joint_name in self.metadata['joint_names']:
-            lower, upper = self.metadata['joint_limits'][joint_name]
-            q_min.append(lower)
-            q_max.append(upper)
-        self.q_min = torch.tensor(q_min, device=device, dtype=torch.float32)
-        self.q_max = torch.tensor(q_max, device=device, dtype=torch.float32)
-        
-        # Results storage
-        self.results = None
-        self.detailed_results = None
-    
-    def info(self):
-        """Print model and robot information."""
-        print("="*60)
-        print("EVALUATOR INFO")
-        print("="*60)
-        print(f"Checkpoint: {self.checkpoint_path}")
-        print(f"Using EMA model: {self.using_ema}")
-        print(f"Device: {self.device}")
-        print()
-        print("Model Config:")
-        print(f"  Hidden dim: {self.config.get('hidden_dim')}")
-        print(f"  Depth: {self.config.get('depth')}")
-        print(f"  Mode: {self.config.get('mode')}")
-        print()
-        print("Robot Info:")
-        print(f"  URDF: {self.urdf_path}")
-        print(f"  Joints: {self.n_joints}")
-        print(f"  Joint names: {self.metadata['joint_names']}")
-        print("="*60)
-    
-    @torch.no_grad()
-    def evaluate(
-        self,
-        num_samples: int = 1000,
-        return_details: bool = False
-    ) -> Dict[str, Any]:
-        """
-        Run evaluation on random samples.
-        
-        Args:
-            num_samples: Number of test samples
-            return_details: Whether to return detailed per-sample results
-            
-        Returns:
-            Dictionary with evaluation metrics
-        """
-        # Generate test samples
-        q_gt = torch.rand(num_samples, self.n_joints, device=self.device)
-        q_gt = q_gt * (self.q_max - self.q_min) + self.q_min
-        
-        # Compute ground truth FK
-        target_pos, target_quat = self.robot_fk.forward_kinematics(q_gt)
-        target_quat = target_quat / (torch.norm(target_quat, dim=-1, keepdim=True) + 1e-8)
-        
-        # Prepare target pose for model
-        target_pose = torch.cat([target_pos, target_quat], dim=-1)
-        
-        # Inference
-        start_time = time.time()
-        
-        # Sample from noise
-        z1 = torch.randn(num_samples, self.n_joints, device=self.device)
-        r = torch.zeros(num_samples, device=self.device)
-        t = torch.ones(num_samples, device=self.device)
-        
-        u, _ = self.model(z1, r, t, target_pose)
-        q_pred_norm = z1 - u
-        
-        # Denormalize
-        q_pred = (q_pred_norm + 1) * (self.q_max - self.q_min) / 2 + self.q_min
-        
-        # Compute FK for predictions
-        pred_pos, pred_quat = self.robot_fk.forward_kinematics(q_pred)
-        pred_quat = pred_quat / (torch.norm(pred_quat, dim=-1, keepdim=True) + 1e-8)
-        
-        inference_time = time.time() - start_time
-        
-        # Compute errors
-        pos_err = torch.norm(pred_pos - target_pos, dim=-1)
-        
-        # Orientation error (using quaternion distance)
-        dot_prod = torch.abs(torch.sum(pred_quat * target_quat, dim=-1))
-        dot_prod = torch.clamp(dot_prod, 0.0, 1.0)
-        rot_err_rad = 2 * torch.acos(dot_prod)  # in radians
-        rot_err_deg = torch.rad2deg(rot_err_rad)  # in degrees
-        
-        # Joint angle error (for diversity analysis)
-        joint_err = q_pred - q_gt
-        
-        # Success metrics
-        success_1cm = ((pos_err < 0.01) & (rot_err_rad < 0.1)).float().mean().item() * 100
-        success_5mm = ((pos_err < 0.005) & (rot_err_rad < 0.05)).float().mean().item() * 100
-        success_1mm = ((pos_err < 0.001) & (rot_err_rad < 0.01)).float().mean().item() * 100
-        
-        # Position-only success rates
-        pos_success_1cm = (pos_err < 0.01).float().mean().item() * 100
-        pos_success_5mm = (pos_err < 0.005).float().mean().item() * 100
-        pos_success_1mm = (pos_err < 0.001).float().mean().item() * 100
-        
-        self.results = {
-            'num_samples': num_samples,
-            'inference_time_ms': inference_time * 1000,
-            'per_sample_time_ms': inference_time / num_samples * 1000,
-            
-            # Position errors (in meters and cm)
-            'pos_err_mean_m': pos_err.mean().item(),
-            'pos_err_std_m': pos_err.std().item(),
-            'pos_err_max_m': pos_err.max().item(),
-            'pos_err_median_m': pos_err.median().item(),
-            'pos_err_mean_cm': pos_err.mean().item() * 100,
-            'pos_err_std_cm': pos_err.std().item() * 100,
-            
-            # Orientation errors (in degrees)
-            'rot_err_mean_deg': rot_err_deg.mean().item(),
-            'rot_err_std_deg': rot_err_deg.std().item(),
-            'rot_err_max_deg': rot_err_deg.max().item(),
-            'rot_err_median_deg': rot_err_deg.median().item(),
-            
-            # Success rates
-            'success_1cm_0.1rad': success_1cm,
-            'success_5mm_0.05rad': success_5mm,
-            'success_1mm_0.01rad': success_1mm,
-            'pos_success_1cm': pos_success_1cm,
-            'pos_success_5mm': pos_success_5mm,
-            'pos_success_1mm': pos_success_1mm,
-        }
-        
-        if return_details:
-            self.detailed_results = {
-                'q_gt': q_gt.cpu(),
-                'q_pred': q_pred.cpu(),
-                'target_pos': target_pos.cpu(),
-                'target_quat': target_quat.cpu(),
-                'pred_pos': pred_pos.cpu(),
-                'pred_quat': pred_quat.cpu(),
-                'pos_err': pos_err.cpu(),
-                'rot_err_deg': rot_err_deg.cpu(),
-                'joint_err': joint_err.cpu(),
-            }
-        
-        return self.results
-    
-    def print_results(self):
-        """Print evaluation results in a formatted way."""
-        if self.results is None:
-            print("No evaluation results. Run evaluate() first.")
-            return
-        
-        r = self.results
-        print("\n" + "="*60)
-        print("EVALUATION RESULTS")
-        print("="*60)
-        print(f"Samples: {r['num_samples']}")
-        print(f"Total inference time: {r['inference_time_ms']:.2f} ms")
-        print(f"Per-sample time: {r['per_sample_time_ms']:.4f} ms")
-        print()
-        print("Position Error:")
-        print(f"  Mean:   {r['pos_err_mean_cm']:.4f} cm")
-        print(f"  Std:    {r['pos_err_std_cm']:.4f} cm")
-        print(f"  Median: {r['pos_err_median_m']*100:.4f} cm")
-        print(f"  Max:    {r['pos_err_max_m']*100:.4f} cm")
-        print()
-        print("Orientation Error:")
-        print(f"  Mean:   {r['rot_err_mean_deg']:.4f}°")
-        print(f"  Std:    {r['rot_err_std_deg']:.4f}°")
-        print(f"  Median: {r['rot_err_median_deg']:.4f}°")
-        print(f"  Max:    {r['rot_err_max_deg']:.4f}°")
-        print()
-        print("Success Rates (Position + Orientation):")
-        print(f"  <1cm, <5.7°:   {r['success_1cm_0.1rad']:.2f}%")
-        print(f"  <5mm, <2.9°:   {r['success_5mm_0.05rad']:.2f}%")
-        print(f"  <1mm, <0.6°:   {r['success_1mm_0.01rad']:.2f}%")
-        print()
-        print("Position-Only Success Rates:")
-        print(f"  <1cm:  {r['pos_success_1cm']:.2f}%")
-        print(f"  <5mm:  {r['pos_success_5mm']:.2f}%")
-        print(f"  <1mm:  {r['pos_success_1mm']:.2f}%")
-        print("="*60)
-    
-    def visualize_error_distribution(
-        self,
-        save_path: Optional[str] = None,
-        figsize: Tuple[int, int] = (14, 10)
-    ):
-        """
-        Visualize error distributions.
-        
-        Args:
-            save_path: Path to save figure (None = show)
-            figsize: Figure size
-        """
-        if self.detailed_results is None:
-            print("No detailed results. Run evaluate(return_details=True) first.")
-            return
-        
-        pos_err = self.detailed_results['pos_err'].numpy() * 100  # Convert to cm
-        rot_err = self.detailed_results['rot_err_deg'].numpy()
-        
-        fig = plt.figure(figsize=figsize)
-        gs = GridSpec(2, 3, figure=fig)
-        
-        # Position error histogram
-        ax1 = fig.add_subplot(gs[0, 0])
-        ax1.hist(pos_err, bins=50, color='steelblue', edgecolor='white', alpha=0.8)
-        ax1.axvline(np.mean(pos_err), color='red', linestyle='--', label=f'Mean: {np.mean(pos_err):.3f} cm')
-        ax1.axvline(np.median(pos_err), color='orange', linestyle='--', label=f'Median: {np.median(pos_err):.3f} cm')
-        ax1.set_xlabel('Position Error (cm)')
-        ax1.set_ylabel('Count')
-        ax1.set_title('Position Error Distribution')
-        ax1.legend()
-        
-        # Orientation error histogram
-        ax2 = fig.add_subplot(gs[0, 1])
-        ax2.hist(rot_err, bins=50, color='coral', edgecolor='white', alpha=0.8)
-        ax2.axvline(np.mean(rot_err), color='red', linestyle='--', label=f'Mean: {np.mean(rot_err):.3f}°')
-        ax2.axvline(np.median(rot_err), color='orange', linestyle='--', label=f'Median: {np.median(rot_err):.3f}°')
-        ax2.set_xlabel('Orientation Error (degrees)')
-        ax2.set_ylabel('Count')
-        ax2.set_title('Orientation Error Distribution')
-        ax2.legend()
-        
-        # Position vs Orientation error scatter
-        ax3 = fig.add_subplot(gs[0, 2])
-        scatter = ax3.scatter(pos_err, rot_err, c=pos_err + rot_err/10, cmap='viridis', 
-                             alpha=0.5, s=10)
-        ax3.axvline(1.0, color='green', linestyle='--', alpha=0.5, label='1 cm threshold')
-        ax3.axhline(5.7, color='green', linestyle='--', alpha=0.5, label='5.7° threshold')
-        ax3.set_xlabel('Position Error (cm)')
-        ax3.set_ylabel('Orientation Error (degrees)')
-        ax3.set_title('Position vs Orientation Error')
-        ax3.legend()
-        plt.colorbar(scatter, ax=ax3, label='Combined Error')
-        
-        # CDF plots
-        ax4 = fig.add_subplot(gs[1, 0])
-        sorted_pos = np.sort(pos_err)
-        cdf_pos = np.arange(1, len(sorted_pos) + 1) / len(sorted_pos) * 100
-        ax4.plot(sorted_pos, cdf_pos, color='steelblue', linewidth=2)
-        ax4.axvline(1.0, color='green', linestyle='--', alpha=0.7)
-        ax4.axvline(0.5, color='orange', linestyle='--', alpha=0.7)
-        ax4.axvline(0.1, color='red', linestyle='--', alpha=0.7)
-        ax4.set_xlabel('Position Error (cm)')
-        ax4.set_ylabel('Cumulative Percentage (%)')
-        ax4.set_title('Position Error CDF')
-        ax4.grid(True, alpha=0.3)
-        ax4.set_xlim(0, np.percentile(pos_err, 99))
-        
-        ax5 = fig.add_subplot(gs[1, 1])
-        sorted_rot = np.sort(rot_err)
-        cdf_rot = np.arange(1, len(sorted_rot) + 1) / len(sorted_rot) * 100
-        ax5.plot(sorted_rot, cdf_rot, color='coral', linewidth=2)
-        ax5.axvline(5.7, color='green', linestyle='--', alpha=0.7, label='5.7° (0.1 rad)')
-        ax5.axvline(2.9, color='orange', linestyle='--', alpha=0.7, label='2.9° (0.05 rad)')
-        ax5.set_xlabel('Orientation Error (degrees)')
-        ax5.set_ylabel('Cumulative Percentage (%)')
-        ax5.set_title('Orientation Error CDF')
-        ax5.grid(True, alpha=0.3)
-        ax5.legend()
-        ax5.set_xlim(0, np.percentile(rot_err, 99))
-        
-        # Per-joint error boxplot
-        ax6 = fig.add_subplot(gs[1, 2])
-        joint_err = self.detailed_results['joint_err'].numpy()
-        joint_names = [f'J{i+1}' for i in range(self.n_joints)]
-        bp = ax6.boxplot(joint_err, labels=joint_names, patch_artist=True)
-        colors = plt.cm.viridis(np.linspace(0, 1, self.n_joints))
-        for patch, color in zip(bp['boxes'], colors):
-            patch.set_facecolor(color)
-            patch.set_alpha(0.7)
-        ax6.set_xlabel('Joint')
-        ax6.set_ylabel('Joint Angle Error (rad)')
-        ax6.set_title('Per-Joint Angle Error')
-        ax6.axhline(0, color='gray', linestyle='-', alpha=0.3)
-        
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            print(f"Figure saved to: {save_path}")
-        else:
-            plt.show()
-        
-        plt.close()
-    
-    def visualize_workspace(
-        self,
-        num_samples: int = 500,
-        save_path: Optional[str] = None,
-        figsize: Tuple[int, int] = (14, 6)
-    ):
-        """
-        Visualize workspace coverage and prediction accuracy in 3D.
-        
-        Args:
-            num_samples: Number of samples to visualize
-            save_path: Path to save figure (None = show)
-            figsize: Figure size
-        """
-        if self.detailed_results is None:
-            print("No detailed results. Run evaluate(return_details=True) first.")
-            return
-        
-        # Limit samples for visualization
-        n = min(num_samples, len(self.detailed_results['target_pos']))
-        
-        target_pos = self.detailed_results['target_pos'][:n].numpy()
-        pred_pos = self.detailed_results['pred_pos'][:n].numpy()
-        pos_err = self.detailed_results['pos_err'][:n].numpy() * 100  # cm
-        
-        fig = plt.figure(figsize=figsize)
-        
-        # 3D scatter - target positions colored by error
-        ax1 = fig.add_subplot(121, projection='3d')
-        scatter = ax1.scatter(
-            target_pos[:, 0], target_pos[:, 1], target_pos[:, 2],
-            c=pos_err, cmap='RdYlGn_r', s=20, alpha=0.7,
-            vmin=0, vmax=np.percentile(pos_err, 95)
-        )
-        ax1.set_xlabel('X (m)')
-        ax1.set_ylabel('Y (m)')
-        ax1.set_zlabel('Z (m)')
-        ax1.set_title('Workspace Coverage\n(colored by position error)')
-        plt.colorbar(scatter, ax=ax1, label='Error (cm)', shrink=0.6)
-        
-        # 3D scatter - prediction vs target with error vectors
-        ax2 = fig.add_subplot(122, projection='3d')
-        
-        # Sample fewer points for error vectors to avoid clutter
-        step = max(1, n // 100)
-        for i in range(0, n, step):
-            ax2.plot(
-                [target_pos[i, 0], pred_pos[i, 0]],
-                [target_pos[i, 1], pred_pos[i, 1]],
-                [target_pos[i, 2], pred_pos[i, 2]],
-                color='red', alpha=0.3, linewidth=0.5
-            )
-        
-        ax2.scatter(target_pos[:, 0], target_pos[:, 1], target_pos[:, 2],
-                   c='blue', s=10, alpha=0.5, label='Target')
-        ax2.scatter(pred_pos[:, 0], pred_pos[:, 1], pred_pos[:, 2],
-                   c='green', s=10, alpha=0.5, label='Predicted')
-        
-        ax2.set_xlabel('X (m)')
-        ax2.set_ylabel('Y (m)')
-        ax2.set_zlabel('Z (m)')
-        ax2.set_title('Target vs Predicted Positions\n(red lines = errors)')
-        ax2.legend()
-        
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            print(f"Figure saved to: {save_path}")
-        else:
-            plt.show()
-        
-        plt.close()
-    
-    def visualize_all(
-        self,
-        output_dir: Optional[str] = None,
-        prefix: str = "eval"
-    ):
-        """
-        Generate all visualizations.
-        
-        Args:
-            output_dir: Directory to save figures (None = show interactively)
-            prefix: Filename prefix for saved figures
-        """
-        if self.detailed_results is None:
-            print("Running evaluation with detailed results...")
-            self.evaluate(num_samples=1000, return_details=True)
-        
-        self.print_results()
-        
-        if output_dir:
-            output_dir = Path(output_dir)
-            output_dir.mkdir(parents=True, exist_ok=True)
-            
-            self.visualize_error_distribution(
-                save_path=str(output_dir / f"{prefix}_error_distribution.png")
-            )
-            self.visualize_workspace(
-                save_path=str(output_dir / f"{prefix}_workspace.png")
-            )
-            
-            # Save results as JSON
-            results_path = output_dir / f"{prefix}_results.json"
-            with open(results_path, 'w') as f:
-                json.dump(self.results, f, indent=2)
-            print(f"Results saved to: {results_path}")
-        else:
-            self.visualize_error_distribution()
-            self.visualize_workspace()
-    
-    def compare_refinement(
-        self,
-        num_samples: int = 100,
-        refinement_steps: int = 10,
-        refinement_lr: float = 0.05,
-        save_path: Optional[str] = None
-    ):
-        """
-        Compare model predictions with and without refinement.
-        
-        Args:
-            num_samples: Number of test samples
-            refinement_steps: Number of refinement iterations
-            refinement_lr: Learning rate for refinement
-            save_path: Path to save figure
-        """
-        # Generate test samples
-        q_gt = torch.rand(num_samples, self.n_joints, device=self.device)
-        q_gt = q_gt * (self.q_max - self.q_min) + self.q_min
-        
-        with torch.no_grad():
-            target_pos, target_quat = self.robot_fk.forward_kinematics(q_gt)
-            target_quat = target_quat / (torch.norm(target_quat, dim=-1, keepdim=True) + 1e-8)
-        
-        target_pose = torch.cat([target_pos, target_quat], dim=-1)
-        
-        # Initial prediction
-        with torch.no_grad():
-            z1 = torch.randn(num_samples, self.n_joints, device=self.device)
-            r = torch.zeros(num_samples, device=self.device)
-            t = torch.ones(num_samples, device=self.device)
-            
-            u, _ = self.model(z1, r, t, target_pose)
-            q_init_norm = z1 - u
-            q_init = (q_init_norm + 1) * (self.q_max - self.q_min) / 2 + self.q_min
-        
-        # Refinement
-        q_refined = q_init.clone().requires_grad_(True)
-        optimizer = torch.optim.Adam([q_refined], lr=refinement_lr)
-        
-        errors_over_steps = []
-        
-        for step in range(refinement_steps + 1):
-            with torch.no_grad():
-                pred_pos, pred_quat = self.robot_fk.forward_kinematics(q_refined)
-                pred_quat = pred_quat / (torch.norm(pred_quat, dim=-1, keepdim=True) + 1e-8)
-                pos_err = torch.norm(pred_pos - target_pos, dim=-1)
-                errors_over_steps.append(pos_err.mean().item() * 100)  # cm
-            
-            if step < refinement_steps:
-                optimizer.zero_grad()
-                pred_pos, pred_quat = self.robot_fk.forward_kinematics(q_refined)
-                pred_quat = pred_quat / (torch.norm(pred_quat, dim=-1, keepdim=True) + 1e-8)
-                
-                loss = torch.norm(pred_pos - target_pos, dim=-1).mean()
-                loss += torch.norm(pred_quat - target_quat, dim=-1).mean()
-                
-                loss.backward()
-                optimizer.step()
-        
-        # Plot
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.plot(range(refinement_steps + 1), errors_over_steps, 'b-o', linewidth=2, markersize=8)
-        ax.axhline(errors_over_steps[0], color='red', linestyle='--', 
-                   label=f'Initial: {errors_over_steps[0]:.4f} cm')
-        ax.axhline(errors_over_steps[-1], color='green', linestyle='--',
-                   label=f'Final: {errors_over_steps[-1]:.4f} cm')
-        
-        ax.set_xlabel('Refinement Step')
-        ax.set_ylabel('Mean Position Error (cm)')
-        ax.set_title('Error Reduction with Refinement')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        improvement = (1 - errors_over_steps[-1] / errors_over_steps[0]) * 100
-        ax.text(0.5, 0.95, f'Improvement: {improvement:.1f}%', 
-                transform=ax.transAxes, ha='center', va='top',
-                fontsize=12, bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-        
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            print(f"Figure saved to: {save_path}")
-        else:
-            plt.show()
-        
-        plt.close()
-        
-        return {
-            'initial_error_cm': errors_over_steps[0],
-            'final_error_cm': errors_over_steps[-1],
-            'improvement_percent': improvement,
-            'errors_over_steps': errors_over_steps
-        }
-
-
-def evaluate_model(
-    checkpoint_path: str,
-    urdf_path: str,
-    num_samples: int = 1000,
-    device: Optional[str] = None,
-    visualize: bool = True,
-    output_dir: Optional[str] = None
-) -> Dict[str, Any]:
-    """
-    Convenience function to evaluate a trained model.
+    Two inference modes (from method.md):
+    1. Trajectory tracking: Given current q_ref, find nearest solution for pose_target
+    2. Global solving: Use random q_ref to discover all possible solutions
     
     Args:
-        checkpoint_path: Path to model checkpoint
-        urdf_path: Path to URDF file
-        num_samples: Number of test samples
-        device: Device to use
-        visualize: Whether to generate visualizations
-        output_dir: Directory to save outputs (None = show interactively)
-    
+        model: ConditionalMLP model
+        pose_target: (B, 7) Target end-effector pose
+        q_ref: (B, n_joints) Reference joint configuration. If None, use random.
+        num_steps: Number of sampling steps
+        device: Device
     Returns:
-        Evaluation results dictionary
+        q_pred: (B, n_joints) Predicted joint configuration (nearest to q_ref)
     """
-    evaluator = Evaluator(checkpoint_path, urdf_path, device)
-    evaluator.info()
+    batch_size = pose_target.shape[0]
+    n_joints = model.n_joints
+
+    # If no q_ref provided, use random initialization (global solving mode)
+    if q_ref is None:
+        q_ref = torch.randn(batch_size, n_joints, device=device)
     
-    results = evaluator.evaluate(num_samples, return_details=True)
-    evaluator.print_results()
+    # Start from q_ref (this is our t=0 state)
+    z = q_ref.clone()
     
-    if visualize:
-        evaluator.visualize_all(output_dir)
+    # Noise scale: set to 0 for inference (we want to project to the exact manifold)
+    c = torch.zeros(batch_size, 1, device=device)
+
+    if num_steps == 1:
+        # Single-step: Flow from t=0 (q_ref) to t=1 (q_gt)
+        # q_pred = z_0 + u(z_0, 0, 1 | pose_target, c=0)
+        # Since u predicts velocity v = q_gt - q_ref, we add it
+        r = torch.zeros(batch_size, device=device)
+        t = torch.ones(batch_size, device=device)
+        u = model(z, pose_target, r, t, c)
+        q_pred = z + u  # Move from q_ref towards the solution
+    else:
+        # Multi-step: iterate from t=0 to t=1
+        time_steps = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
+
+        for i in range(num_steps):
+            t_cur = time_steps[i]
+            t_next = time_steps[i + 1]
+
+            t = torch.full((batch_size,), t_cur, device=device)
+            r = torch.full((batch_size,), t_next, device=device)
+
+            u = model(z, pose_target, t, r, c)
+
+            # Update: z_next = z_cur + (t_next - t_cur) * u
+            z = z + (t_next - t_cur) * u
+
+        q_pred = z
+
+    return q_pred
+
+
+@torch.no_grad()
+def meanflow_ik_global_solver(model, pose_target, num_random_starts=16, num_steps=1, device="cpu"):
+    """
+    Global IK solver that discovers multiple solutions by using diverse q_ref.
     
-    return results
+    This implements the "Global solving" mode from method.md:
+    - Generate K random q_ref points
+    - Each q_ref gets "attracted" to its nearest valid IK solution
+    - Cluster results to find unique solutions
+    
+    Args:
+        model: ConditionalMLP model
+        pose_target: (1, 7) Single target pose
+        num_random_starts: Number of random starting points
+        num_steps: Number of flow steps per solution
+        device: Device
+    Returns:
+        solutions: List of unique joint configurations
+    """
+    n_joints = model.n_joints
+    
+    # Expand pose_target to match num_random_starts
+    pose_batch = pose_target.expand(num_random_starts, -1)
+    
+    # Generate diverse random starting points
+    q_refs = torch.randn(num_random_starts, n_joints, device=device) * 2.0  # Larger spread
+    
+    # Run flow from each q_ref
+    q_preds = meanflow_ik_sampler(model, pose_batch, q_ref=q_refs, num_steps=num_steps, device=device)
+    
+    # Cluster to find unique solutions (simple distance-based)
+    solutions = []
+    q_preds_np = q_preds.cpu().numpy()
+    
+    for q in q_preds_np:
+        is_new = True
+        for existing in solutions:
+            if np.linalg.norm(q - existing) < 0.1:  # Threshold for "same" solution
+                is_new = False
+                break
+        if is_new:
+            solutions.append(q)
+    
+    return solutions
+
+
+def quaternion_distance(q1, q2):
+    """
+    Compute angular distance between two quaternions (in degrees)
+    Args:
+        q1, q2: (..., 4) quaternions (x, y, z, w)
+    Returns:
+        angle: angular distance in degrees
+    """
+    # Normalize quaternions
+    q1 = q1 / (np.linalg.norm(q1, axis=-1, keepdims=True) + 1e-8)
+    q2 = q2 / (np.linalg.norm(q2, axis=-1, keepdims=True) + 1e-8)
+
+    # Compute dot product
+    dot = np.clip(np.sum(q1 * q2, axis=-1), -1.0, 1.0)
+
+    # Angular distance
+    angle_rad = 2 * np.arccos(np.abs(dot))
+    angle_deg = np.degrees(angle_rad)
+
+    return angle_deg
+
+
+def evaluate_model(model, data_loader, robot, end_effector, num_steps=1, device="cpu", use_gt_ref=False):
+    """
+    Evaluate IK model
+    
+    Args:
+        use_gt_ref: If True, use ground truth joints as q_ref (trajectory tracking mode)
+                    If False, use random q_ref (global solving mode)
+    """
+    model.eval()
+
+    all_pos_errors = []
+    all_rot_errors = []
+    all_joint_errors = []
+    inference_times = []
+
+    for joints_true, pose_target in tqdm(data_loader, desc="Evaluating"):
+        pose_target = pose_target.to(device)
+        joints_true_tensor = joints_true.to(device)
+        joints_true = joints_true.numpy()
+
+        batch_size = pose_target.shape[0]
+
+        # Set q_ref based on evaluation mode
+        if use_gt_ref:
+            # Trajectory tracking mode: use GT with small noise
+            q_ref = joints_true_tensor + torch.randn_like(joints_true_tensor) * 0.1
+        else:
+            # Global solving mode: use random q_ref
+            q_ref = None
+
+        # Measure inference time
+        start_time = time.time()
+        joints_pred = meanflow_ik_sampler(
+            model, pose_target, q_ref=q_ref, num_steps=num_steps, device=device
+        )
+        inference_times.append((time.time() - start_time) / batch_size)
+
+        joints_pred = joints_pred.cpu().numpy()
+
+        # Compute FK for predicted joints
+        # Convert to list of configs for FK
+        joints_pred_list = [joints_pred[i] for i in range(batch_size)]
+        transforms_pred = robot.link_fk_batch(cfgs=joints_pred_list, link=end_effector)
+
+        # Extract position and quaternion from predicted transforms
+        positions_pred = transforms_pred[:, :3, 3]
+        rot_matrices_pred = transforms_pred[:, :3, :3]
+        quaternions_pred = Rotation.from_matrix(rot_matrices_pred).as_quat()
+
+        # Extract from target pose (pose_target is already 7D: pos + quat)
+        positions_target = pose_target[:, :3].cpu().numpy()
+        quaternions_target = pose_target[:, 3:].cpu().numpy()
+
+        # Compute errors
+        pos_errors = np.linalg.norm(positions_pred - positions_target, axis=1)
+        rot_errors = quaternion_distance(quaternions_pred, quaternions_target)
+        joint_errors = np.linalg.norm(joints_pred - joints_true, axis=1)
+
+        all_pos_errors.extend(pos_errors.tolist())
+        all_rot_errors.extend(rot_errors.tolist())
+        all_joint_errors.extend(joint_errors.tolist())
+
+    all_pos_errors = np.array(all_pos_errors)
+    all_rot_errors = np.array(all_rot_errors)
+    all_joint_errors = np.array(all_joint_errors)
+
+    # Compute success rate (position < 1cm and rotation < 5°)
+    success_mask = (all_pos_errors < 0.01) & (all_rot_errors < 5.0)
+    success_rate = success_mask.mean() * 100
+
+    # Compute statistics
+    metrics = {
+        "success_rate": success_rate,
+        "position_error": {
+            "mean": float(all_pos_errors.mean()),
+            "std": float(all_pos_errors.std()),
+            "median": float(np.median(all_pos_errors)),
+            "p95": float(np.percentile(all_pos_errors, 95)),
+        },
+        "rotation_error": {
+            "mean": float(all_rot_errors.mean()),
+            "std": float(all_rot_errors.std()),
+            "median": float(np.median(all_rot_errors)),
+            "p95": float(np.percentile(all_rot_errors, 95)),
+        },
+        "joint_error": {
+            "mean": float(all_joint_errors.mean()),
+            "std": float(all_joint_errors.std()),
+            "median": float(np.median(all_joint_errors)),
+        },
+        "inference_speed": {
+            "mean_time_per_sample": float(np.mean(inference_times)),
+            "std_time_per_sample": float(np.std(inference_times)),
+            "samples_per_sec": float(1.0 / np.mean(inference_times)),
+        },
+    }
+
+    return metrics, all_pos_errors, all_rot_errors, all_joint_errors
+
+
+def plot_error_distributions(pos_errors, rot_errors, joint_errors, output_path):
+    """Plot error distributions"""
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+    axes[0].hist(pos_errors * 1000, bins=50, edgecolor="black", alpha=0.7)
+    axes[0].axvline(10, color="r", linestyle="--", label="Success threshold (10mm)")
+    axes[0].set_xlabel("Position Error (mm)")
+    axes[0].set_ylabel("Frequency")
+    axes[0].set_title("Position Error Distribution")
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].hist(rot_errors, bins=50, edgecolor="black", alpha=0.7)
+    axes[1].axvline(5, color="r", linestyle="--", label="Success threshold (5°)")
+    axes[1].set_xlabel("Rotation Error (degrees)")
+    axes[1].set_ylabel("Frequency")
+    axes[1].set_title("Rotation Error Distribution")
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+
+    axes[2].hist(joint_errors, bins=50, edgecolor="black", alpha=0.7)
+    axes[2].set_xlabel("Joint Error (radians)")
+    axes[2].set_ylabel("Frequency")
+    axes[2].set_title("Joint Space Error Distribution")
+    axes[2].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    print(f"Saved error distribution plots to {output_path}")
 
 
 def main():
-    """Command-line interface for evaluation."""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='Evaluate MeanFlow IK Model')
-    parser.add_argument('--checkpoint', type=str, required=True, help='Path to checkpoint file')
-    parser.add_argument('--urdf', type=str, required=True, help='Path to URDF file')
-    parser.add_argument('--samples', type=int, default=1000, help='Number of test samples')
-    parser.add_argument('--device', type=str, default=None, choices=['cuda', 'cpu'])
-    parser.add_argument('--output-dir', type=str, default=None, help='Directory to save outputs')
-    parser.add_argument('--no-visualize', action='store_true', help='Skip visualization')
-    parser.add_argument('--refinement-test', action='store_true', help='Test refinement')
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--checkpoint", type=str, required=True, help="Path to model checkpoint"
+    )
+    parser.add_argument("--data", type=str, required=True, help="Path to dataset .pt")
+    parser.add_argument("--urdf", type=str, required=True, help="Path to URDF file")
+    parser.add_argument(
+        "--end-effector", type=str, required=True, help="End effector link name"
+    )
+    parser.add_argument(
+        "--num-steps", type=int, default=1, help="Number of sampling steps"
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="evaluation_report.json",
+        help="Output report path",
+    )
+    parser.add_argument(
+        "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
+    )
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument(
+        "--use-gt-ref", action="store_true",
+        help="Use ground truth joints as q_ref (trajectory tracking mode)"
+    )
+
     args = parser.parse_args()
-    
-    evaluator = Evaluator(args.checkpoint, args.urdf, args.device)
-    evaluator.info()
-    
-    # Main evaluation
-    results = evaluator.evaluate(args.samples, return_details=True)
-    evaluator.print_results()
-    
-    # Visualizations
-    if not args.no_visualize:
-        evaluator.visualize_all(args.output_dir)
-    
-    # Refinement test
-    if args.refinement_test:
-        print("\n" + "="*60)
-        print("REFINEMENT TEST")
-        print("="*60)
-        save_path = None
-        if args.output_dir:
-            save_path = str(Path(args.output_dir) / "refinement_test.png")
-        refinement_results = evaluator.compare_refinement(save_path=save_path)
-        print(f"Improvement with refinement: {refinement_results['improvement_percent']:.1f}%")
+
+    # Load model
+    print(f"Loading checkpoint from {args.checkpoint}...")
+    checkpoint = torch.load(args.checkpoint, map_location=args.device)
+
+    # Infer n_joints from checkpoint or data
+    data = torch.load(args.data, map_location="cpu")
+    n_joints = data["joints_test"].shape[1]
+
+    model = ConditionalMLP(n_joints=n_joints).to(args.device)
+
+    # Try to load EMA model first, fallback to regular model
+    if "ema_state_dict" in checkpoint:
+        model.load_state_dict(checkpoint["ema_state_dict"])
+        print("Loaded EMA model")
+    else:
+        model.load_state_dict(checkpoint["model_state_dict"])
+        print("Loaded regular model")
+
+    # Load robot
+    print(f"Loading URDF from {args.urdf}...")
+    robot = URDF.load(args.urdf)
+
+    # Load test data
+    print(f"Loading test data from {args.data}...")
+    test_dataset = IKDataset(args.data, split="test")
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+
+    # Evaluate
+    mode_str = "trajectory tracking" if args.use_gt_ref else "global solving"
+    print(f"Evaluating with {args.num_steps}-step sampling ({mode_str} mode)...")
+    metrics, pos_errors, rot_errors, joint_errors = evaluate_model(
+        model,
+        test_loader,
+        robot,
+        args.end_effector,
+        num_steps=args.num_steps,
+        device=args.device,
+        use_gt_ref=args.use_gt_ref,
+    )
+
+    # Print results
+    print("\n" + "=" * 60)
+    print("Evaluation Results")
+    print("=" * 60)
+    print(f"Success Rate: {metrics['success_rate']:.2f}%")
+    print(f"\nPosition Error (mm):")
+    print(f"  Mean: {metrics['position_error']['mean']*1000:.2f}")
+    print(f"  Std:  {metrics['position_error']['std']*1000:.2f}")
+    print(f"  Median: {metrics['position_error']['median']*1000:.2f}")
+    print(f"  P95: {metrics['position_error']['p95']*1000:.2f}")
+    print(f"\nRotation Error (degrees):")
+    print(f"  Mean: {metrics['rotation_error']['mean']:.2f}")
+    print(f"  Std:  {metrics['rotation_error']['std']:.2f}")
+    print(f"  Median: {metrics['rotation_error']['median']:.2f}")
+    print(f"  P95: {metrics['rotation_error']['p95']:.2f}")
+    print(f"\nJoint Error (radians):")
+    print(f"  Mean: {metrics['joint_error']['mean']:.4f}")
+    print(f"  Std:  {metrics['joint_error']['std']:.4f}")
+    print(f"\nInference Speed:")
+    print(
+        f"  Mean time per sample: {metrics['inference_speed']['mean_time_per_sample']*1000:.2f} ms"
+    )
+    print(
+        f"  Throughput: {metrics['inference_speed']['samples_per_sec']:.1f} samples/sec"
+    )
+    print("=" * 60)
+
+    # Save report
+    report = {
+        "config": vars(args),
+        "metrics": metrics,
+    }
+
+    with open(args.output, "w") as f:
+        json.dump(report, f, indent=2)
+    print(f"\nSaved evaluation report to {args.output}")
+
+    # Plot distributions
+    plot_path = args.output.replace(".json", "_plots.png")
+    plot_error_distributions(pos_errors, rot_errors, joint_errors, plot_path)
 
 
 if __name__ == "__main__":
