@@ -29,7 +29,7 @@ class IKDataset(Dataset):
 
 
 @torch.no_grad()
-def meanflow_ik_sampler(model, pose_target, q_ref=None, num_steps=1, device="cpu"):
+def meanflow_ik_sampler(model, pose_target, q_ref=None, num_steps=1, device="cpu", noise_scale=0.0):
     """
     MeanFlow IK sampler with Neighborhood Projection.
     
@@ -43,6 +43,8 @@ def meanflow_ik_sampler(model, pose_target, q_ref=None, num_steps=1, device="cpu
         q_ref: (B, n_joints) Reference joint configuration. If None, use random.
         num_steps: Number of sampling steps
         device: Device
+        noise_scale: Value for the noise_std condition (c). 
+                     Should match training distribution (e.g. 1.0 for global, 0.1 for local).
     Returns:
         q_pred: (B, n_joints) Predicted joint configuration (nearest to q_ref)
     """
@@ -56,8 +58,8 @@ def meanflow_ik_sampler(model, pose_target, q_ref=None, num_steps=1, device="cpu
     # Start from q_ref (this is our t=0 state)
     z = q_ref.clone()
     
-    # Noise scale: set to 0 for inference (we want to project to the exact manifold)
-    c = torch.zeros(batch_size, 1, device=device)
+    # Noise scale condition
+    c = torch.full((batch_size, 1), noise_scale, device=device)
 
     if num_steps == 1:
         # Single-step: Flow from t=0 (q_ref) to t=1 (q_gt)
@@ -156,13 +158,14 @@ def quaternion_distance(q1, q2):
     return angle_deg
 
 
-def evaluate_model(model, data_loader, robot, end_effector, num_steps=1, device="cpu", use_gt_ref=False):
+def evaluate_model(model, data_loader, robot, end_effector, num_steps=1, device="cpu", use_gt_ref=False, noise_scale=0.0):
     """
     Evaluate IK model
     
     Args:
         use_gt_ref: If True, use ground truth joints as q_ref (trajectory tracking mode)
                     If False, use random q_ref (global solving mode)
+        noise_scale: Noise scale condition to pass to the model
     """
     model.eval()
 
@@ -189,7 +192,7 @@ def evaluate_model(model, data_loader, robot, end_effector, num_steps=1, device=
         # Measure inference time
         start_time = time.time()
         joints_pred = meanflow_ik_sampler(
-            model, pose_target, q_ref=q_ref, num_steps=num_steps, device=device
+            model, pose_target, q_ref=q_ref, num_steps=num_steps, device=device, noise_scale=noise_scale
         )
         inference_times.append((time.time() - start_time) / batch_size)
 
@@ -343,10 +346,18 @@ def main():
     print(f"Loading test data from {args.data}...")
     test_dataset = IKDataset(args.data, split="test")
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
-
     # Evaluate
     mode_str = "trajectory tracking" if args.use_gt_ref else "global solving"
+    
+    # Determine noise scale
+    # For global solving (random init), we are far from manifold, so use large noise scale (e.g. max training noise)
+    # For tracking (GT + noise), we are close, so use small noise scale
+    # Note: Model was trained with noise in [0.1, 1.0]. Passing 0.0 is OOD.
+    noise_scale = 1.0 if not args.use_gt_ref else 0.1
+    
     print(f"Evaluating with {args.num_steps}-step sampling ({mode_str} mode)...")
+    print(f"Using noise_scale condition: {noise_scale}")
+    
     metrics, pos_errors, rot_errors, joint_errors = evaluate_model(
         model,
         test_loader,
@@ -355,6 +366,7 @@ def main():
         num_steps=args.num_steps,
         device=args.device,
         use_gt_ref=args.use_gt_ref,
+        noise_scale=noise_scale,
     )
 
     # Print results

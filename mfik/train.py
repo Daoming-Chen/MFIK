@@ -32,7 +32,7 @@ def get_args():
     parser.add_argument(
         "--output-dir", type=str, required=True, help="Directory to save checkpoints"
     )
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--save-interval", type=int, default=10)
@@ -81,8 +81,10 @@ def main():
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=8,
         pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2,
     )
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
 
@@ -93,6 +95,11 @@ def main():
     model = ConditionalMLP(n_joints=n_joints).to(args.device)
     ema_model = copy.deepcopy(model).to(args.device)
     ema_model.requires_grad_(False)
+
+    # Compile model for faster training
+    if hasattr(torch, "compile"):
+        print("Compiling model with torch.compile...")
+        model = torch.compile(model)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -123,15 +130,15 @@ def main():
     global_step = 0
     for epoch in range(start_epoch, args.epochs):
         model.train()
-        train_loss = 0.0
+        train_loss = torch.tensor(0.0, device=args.device)
         
         # Update curriculum learning epoch
         loss_fn.set_epoch(epoch, args.epochs)
 
         pbar = tqdm.tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
         for joints, pose in pbar:
-            joints = joints.to(args.device)
-            pose = pose.to(args.device)
+            joints = joints.to(args.device, dtype=torch.float32)
+            pose = pose.to(args.device, dtype=torch.float32)
 
             loss, raw_loss = loss_fn(model, joints, pose)
 
@@ -144,11 +151,12 @@ def main():
             optimizer.step()
             update_ema(model, ema_model)
 
-            train_loss += loss.item()
+            train_loss += loss.detach()
             global_step += 1
 
             if global_step % 100 == 0:
-                writer.add_scalar("train/loss", loss.item(), global_step)
+                loss_val = loss.item()
+                writer.add_scalar("train/loss", loss_val, global_step)
                 writer.add_scalar("train/raw_loss", raw_loss.item(), global_step)
                 writer.add_scalar(
                     "train/lr", optimizer.param_groups[0]["lr"], global_step
@@ -158,23 +166,23 @@ def main():
                     current_noise = loss_fn.get_noise_std(1, joints.device).item()
                     writer.add_scalar("train/noise_std", current_noise, global_step)
 
-            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+                pbar.set_postfix({"loss": f"{loss_val:.4f}"})
 
-        avg_train_loss = train_loss / len(train_loader)
+        avg_train_loss = train_loss.item() / len(train_loader)
         scheduler.step()
 
         # Validation
         model.eval()
-        val_loss = 0.0
+        val_loss = torch.tensor(0.0, device=args.device)
         with torch.no_grad():
             for joints, pose in val_loader:
-                joints = joints.to(args.device)
-                pose = pose.to(args.device)
+                joints = joints.to(args.device, dtype=torch.float32)
+                pose = pose.to(args.device, dtype=torch.float32)
                 # Use EMA model for validation
                 loss, _ = loss_fn(ema_model, joints, pose)
-                val_loss += loss.item()
+                val_loss += loss
 
-        avg_val_loss = val_loss / len(val_loader)
+        avg_val_loss = val_loss.item() / len(val_loader)
         writer.add_scalar("val/loss", avg_val_loss, epoch)
         print(
             f"Epoch {epoch+1} - Train Loss: {avg_train_loss:.6f}, Val Loss (EMA): {avg_val_loss:.6f}"
